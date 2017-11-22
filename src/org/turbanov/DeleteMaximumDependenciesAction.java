@@ -13,8 +13,8 @@ import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.project.ProjectCoreUtil;
-import com.intellij.openapi.roots.ContentIterator;
 import com.intellij.openapi.roots.ModuleRootManager;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.util.containers.ContainerUtil;
 import gnu.trove.THashSet;
@@ -22,6 +22,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.idea.maven.model.MavenId;
 import org.jetbrains.idea.maven.project.MavenProject;
 import org.jetbrains.idea.maven.project.MavenProjectsManager;
+import org.jetbrains.jps.model.java.JavaSourceRootType;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -31,6 +32,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * @author Andrey Turbanov
@@ -53,24 +55,35 @@ public class DeleteMaximumDependenciesAction extends AnAction {
 
         Module[] allModules = moduleManager.getModules();
         List<Module> toDispose = new ArrayList<>();
+        List<VirtualFile> toDeleteTests = new ArrayList<>();
         for (Module nextModule : allModules) {
             if (!moduleWithAllDependencies.contains(nextModule)) {
                 toDispose.add(nextModule);
+            } else if (nextModule != module) {
+                ModuleRootManager rootManager = ModuleRootManager.getInstance(nextModule);
+                List<VirtualFile> testRoots = rootManager.getSourceRoots(JavaSourceRootType.TEST_SOURCE);
+                toDeleteTests.addAll(testRoots);
             }
         }
         log.info("Should dispose this modules: " + toDispose);
+        log.info("Should delete this test roots: " + toDeleteTests);
 
+        int sumSize = toDispose.size() + toDeleteTests.size();
         ModifiableModuleModel modifiableModel = moduleManager.getModifiableModel();
         ProgressManager.getInstance().run(new Task.Modal(project, "Removing Modules", true) {
             public void run(@NotNull ProgressIndicator indicator) {
                 for (int i = 0; i < toDispose.size(); i++) {
                     Module moduleToDispose = toDispose.get(i);
-                    indicator.setFraction((double)i / toDispose.size());
+                    indicator.setFraction((double)i / sumSize);
                     indicator.setText("Removing " + moduleToDispose);
                     ModuleRootManager rootManager = ModuleRootManager.getInstance(moduleToDispose);
                     ApplicationManager.getApplication().invokeAndWait(() -> {
-                        deleteFiles(rootManager);
-                        deleteFiles(rootManager);
+                        int maximum = 40;
+                        for (int j = 0; j < maximum; j++) {
+                            if (!deleteFiles(rootManager)) {
+                                break;
+                            }
+                        }
                     });
 
                     try {
@@ -80,6 +93,22 @@ public class DeleteMaximumDependenciesAction extends AnAction {
                     }
                     modifiableModel.disposeModule(moduleToDispose);
                 }
+
+                ApplicationManager.getApplication().invokeAndWait(() -> {
+                    ApplicationManager.getApplication().runWriteAction(() -> {
+                        for (int i = 0; i < toDeleteTests.size(); i++) {
+                            VirtualFile next = toDeleteTests.get(i);
+                            indicator.setFraction((double) (i + toDispose.size()) / sumSize);
+                            indicator.setText("Removing test root: " + next);
+                            deleteFile(next);
+                            try {
+                                TimeUnit.MILLISECONDS.sleep(betweenModuleSleepMills);
+                            } catch (InterruptedException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                    });
+                });
             }
         });
     }
@@ -95,8 +124,7 @@ public class DeleteMaximumDependenciesAction extends AnAction {
         Queue<Module> sourceModules = new ArrayDeque<>(resultSet);
         while (!sourceModules.isEmpty()) {
             Module sourceModule = sourceModules.poll();
-            boolean isMavenized = manager.isMavenizedModule(sourceModule);
-            if (!isMavenized) {
+            if (!manager.isMavenizedModule(sourceModule)) {
                 continue;
             }
             MavenProject mavenProject = manager.findProject(sourceModule);
@@ -123,30 +151,36 @@ public class DeleteMaximumDependenciesAction extends AnAction {
         return resultSet;
     }
 
-    private void deleteFiles(ModuleRootManager rootManager) {
-        ApplicationManager.getApplication().runWriteAction(new Runnable() {
-            @Override
-            public void run() {
-                rootManager.getFileIndex().iterateContent(new ContentIterator() {
-                    @Override
-                    public boolean processFile(VirtualFile virtualFile) {
-                        if (ProjectCoreUtil.isProjectOrWorkspaceFile(virtualFile) && !virtualFile.getName().endsWith(".iml")) {
-                            log.info("Skip file: " + virtualFile);
-                            return true;
-                        }
-                        VirtualFile[] children = virtualFile.getChildren();
-                        if (children == null || children.length == 0) {
-                            log.info("Removing file: " + virtualFile);
-                            try {
-                                virtualFile.delete(this);
-                            } catch (IOException e) {
-                                log.warn(e);
-                            }
-                        }
-                        return true;
+    private boolean deleteFiles(ModuleRootManager rootManager) {
+        Boolean result = ApplicationManager.getApplication().runWriteAction((Computable<Boolean>) () -> {
+            AtomicBoolean result1 = new AtomicBoolean(false);
+            rootManager.getFileIndex().iterateContent(virtualFile -> {
+                if (ProjectCoreUtil.isProjectOrWorkspaceFile(virtualFile) && !virtualFile.getName().endsWith(".iml")) {
+                    log.info("Skip file: " + virtualFile);
+                    return true;
+                }
+                VirtualFile[] children = virtualFile.getChildren();
+                if (children == null || children.length == 0) {
+                    boolean deleted = deleteFile(virtualFile);
+                    if (deleted) {
+                        result1.set(true);
                     }
-                });
-            }
+                }
+                return true;
+            });
+            return result1.get();
         });
+        return result;
+    }
+
+    private boolean deleteFile(VirtualFile virtualFile) {
+        log.info("Removing file: " + virtualFile);
+        try {
+            virtualFile.delete(this);
+            return true;
+        } catch (IOException e) {
+            log.warn(e);
+            return false;
+        }
     }
 }
